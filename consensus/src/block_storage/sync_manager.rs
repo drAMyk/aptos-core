@@ -260,6 +260,7 @@ impl BlockStore {
             .iter()
             .any(|block| block.id() == highest_commit_cert.certified_block().id())
         {
+            panic!("Actually reached a fork!");
             let mut additional_blocks = retriever
                 .retrieve_block_for_qc(
                     highest_commit_cert,

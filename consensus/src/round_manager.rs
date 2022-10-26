@@ -693,6 +693,7 @@ impl RoundManager {
 
         self.round_state.record_vote(vote.clone());
         let vote_msg = VoteMsg::new(vote, self.block_store.sync_info());
+        info!("Sending vote {:?}", vote_msg);
         self.network.send_vote(vote_msg, vec![recipient]).await;
         Ok(())
     }

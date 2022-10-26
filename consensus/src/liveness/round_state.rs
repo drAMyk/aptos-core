@@ -225,6 +225,10 @@ impl RoundState {
     /// return true. Otherwise ignore and return false.
     pub fn process_local_timeout(&mut self, round: Round) -> bool {
         if round != self.current_round {
+            info!(
+                "Current round {} , timeout round {}",
+                self.current_round, round
+            );
             return false;
         }
         warn!(round = round, "Local timeout");

@@ -24,6 +24,7 @@ use crate::{
 use aptos_config::{config::ConsensusConfig, network_id::NetworkId};
 use aptos_crypto::HashValue;
 use aptos_infallible::Mutex;
+use aptos_logger::{prelude::info, Level};
 use aptos_secure_storage::Storage;
 use aptos_types::{
     epoch_state::EpochState,
@@ -51,7 +52,7 @@ use futures::{
     channel::{mpsc, oneshot},
     executor::block_on,
     stream::select,
-    Stream, StreamExt,
+    FutureExt, Stream, StreamExt,
 };
 use network::{
     peer_manager::{conn_notifs_channel, ConnectionRequestSender, PeerManagerRequestSender},
@@ -63,8 +64,19 @@ use network::{
     ProtocolId,
 };
 use safety_rules::{PersistentSafetyStorage, SafetyRulesManager};
-use std::{iter::FromIterator, sync::Arc, time::Duration};
-use tokio::{runtime::Handle, time::timeout};
+use std::{
+    iter::FromIterator,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{
+    runtime::{Handle, Runtime},
+    task::JoinHandle,
+    time::timeout,
+};
 
 /// Auxiliary struct that is setting up node environment for the test.
 pub struct NodeSetup {
@@ -72,7 +84,7 @@ pub struct NodeSetup {
     round_manager: RoundManager,
     storage: Arc<MockStorage>,
     signer: ValidatorSigner,
-    proposer_author: Author,
+    proposers: Vec<Author>,
     safety_rules_manager: SafetyRulesManager,
     all_events: Box<dyn Stream<Item = Event<ConsensusMsg>> + Send + Unpin>,
     commit_cb_receiver: mpsc::UnboundedReceiver<LedgerInfoWithSignatures>,
@@ -88,17 +100,22 @@ impl NodeSetup {
         RoundState::new(time_interval, time_service, round_timeout_sender)
     }
 
-    fn create_proposer_election(author: Author) -> Box<dyn ProposerElection + Send + Sync> {
-        Box::new(RotatingProposer::new(vec![author], 1))
+    fn create_proposer_election(proposers: Vec<Author>) -> Box<dyn ProposerElection + Send + Sync> {
+        Box::new(RotatingProposer::new(proposers, 1))
     }
 
     fn create_nodes(
         playground: &mut NetworkPlayground,
         executor: Handle,
         num_nodes: usize,
+        proposer_indices: Option<Vec<usize>>,
     ) -> Vec<Self> {
         let (signers, validators) = random_validator_verifier(num_nodes, None, false);
-        let proposer_author = signers[0].author();
+        let proposers = proposer_indices
+            .unwrap_or(vec![0])
+            .iter()
+            .map(|i| signers[*i].author())
+            .collect::<Vec<_>>();
         let validator_set = (&validators).into();
         let waypoint =
             Waypoint::new_epoch_boundary(&LedgerInfo::mock_genesis(Some(validator_set))).unwrap();
@@ -131,7 +148,7 @@ impl NodeSetup {
                 playground,
                 executor.clone(),
                 signer.to_owned(),
-                proposer_author,
+                proposers.clone(),
                 storage,
                 initial_data,
                 safety_rules_manager,
@@ -145,7 +162,7 @@ impl NodeSetup {
         playground: &mut NetworkPlayground,
         executor: Handle,
         signer: ValidatorSigner,
-        proposer_author: Author,
+        proposers: Vec<Author>,
         storage: Arc<MockStorage>,
         initial_data: RecoveryData,
         safety_rules_manager: SafetyRulesManager,
@@ -197,6 +214,7 @@ impl NodeSetup {
             10,
         ));
 
+        let proposer_election = Self::create_proposer_election(proposers.clone());
         let proposal_generator = ProposalGenerator::new(
             author,
             block_store.clone(),
@@ -208,7 +226,6 @@ impl NodeSetup {
         );
 
         let round_state = Self::create_round_state(time_service);
-        let proposer_election = Self::create_proposer_election(proposer_author);
         let mut safety_rules =
             MetricsSafetyRules::new(safety_rules_manager.client(), storage.clone());
         safety_rules.perform_initialize().unwrap();
@@ -234,7 +251,7 @@ impl NodeSetup {
             round_manager,
             storage,
             signer,
-            proposer_author,
+            proposers,
             safety_rules_manager,
             all_events,
             commit_cb_receiver,
@@ -252,7 +269,7 @@ impl NodeSetup {
             playground,
             executor,
             self.signer,
-            self.proposer_author,
+            self.proposers,
             self.storage,
             recover_data,
             self.safety_rules_manager,
@@ -260,12 +277,41 @@ impl NodeSetup {
         )
     }
 
+    pub fn peer_id(&self) -> Author {
+        self.signer.author()
+    }
+
+    pub fn identity_desc(&self) -> String {
+        format!("{} [{}]", self.id, self.peer_id())
+    }
+
+    pub fn no_next(&mut self) {
+        match self.all_events.next().now_or_never().map(|v| v.unwrap()) {
+            Some(Event::RpcRequest(_, msg, _, _)) | Some(Event::Message(_, msg)) => panic!(
+                "Unexpected Consensus Message: {:?} on node {}",
+                msg,
+                self.peer_id()
+            ),
+            Some(_) => panic!("Unexpected Network Event"),
+            None => {}
+        }
+    }
+
     pub async fn next_proposal(&mut self) -> ProposalMsg {
         match self.all_events.next().await.unwrap() {
             Event::Message(_, msg) => match msg {
                 ConsensusMsg::ProposalMsg(p) => *p,
-                msg => panic!("Unexpected Consensus Message: {:?}", msg),
+                msg => panic!(
+                    "Unexpected Consensus Message: {:?} on node {}",
+                    msg,
+                    self.identity_desc()
+                ),
             },
+            Event::RpcRequest(_, msg, _, _) => panic!(
+                "Unexpected Consensus Message: {:?} on node {}",
+                msg,
+                self.peer_id()
+            ),
             _ => panic!("Unexpected Network Event"),
         }
     }
@@ -274,10 +320,95 @@ impl NodeSetup {
         match self.all_events.next().await.unwrap() {
             Event::Message(_, msg) => match msg {
                 ConsensusMsg::VoteMsg(v) => *v,
-                msg => panic!("Unexpected Consensus Message: {:?}", msg),
+                msg => panic!(
+                    "Unexpected Consensus Message: {:?} on node {}",
+                    msg,
+                    self.peer_id()
+                ),
             },
+            Event::RpcRequest(_, msg, _, _) => panic!(
+                "Unexpected Consensus Message: {:?} on node {}",
+                msg,
+                self.peer_id()
+            ),
             _ => panic!("Unexpected Network Event"),
         }
+    }
+
+    pub async fn poll_block_retreival(&mut self) -> Option<IncomingBlockRetrievalRequest> {
+        let message = self.all_events.next().now_or_never();
+        if message.is_some() {
+            info!("Received message {:?}", message);
+        }
+        match message.map(|v| v.unwrap()) {
+            Some(Event::RpcRequest(_, msg, protocol, response_sender)) => match msg {
+                ConsensusMsg::BlockRetrievalRequest(v) => Some(IncomingBlockRetrievalRequest {
+                    req: *v,
+                    protocol,
+                    response_sender,
+                }),
+                msg => panic!(
+                    "Unexpected Consensus Message: {:?} on node {}",
+                    msg,
+                    self.peer_id()
+                ),
+            },
+            Some(Event::Message(_, msg)) => match msg {
+                msg => panic!(
+                    "Unexpected Consensus Message: {:?} on node {}",
+                    msg,
+                    self.peer_id()
+                ),
+            },
+            Some(_) => panic!("Unexpected Network Event"),
+            None => None,
+        }
+    }
+}
+
+fn start_replying_to_block_retreival(mut nodes: Vec<NodeSetup>) -> ReplyingRPCHandle {
+    let done = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+    while !nodes.is_empty() {
+        let mut node = nodes.pop().unwrap();
+        let done_clone = done.clone();
+        handles.push(tokio::spawn(async move {
+            while !done_clone.load(Ordering::Relaxed) {
+                info!("Asking for RPC request on {:?}", node.peer_id());
+                let maybe_request = node.poll_block_retreival().await;
+                if let Some(request) = maybe_request {
+                    info!(
+                        "RPC request received: {:?} on {:?}",
+                        request,
+                        node.peer_id()
+                    );
+                    node.block_store
+                        .process_block_retrieval(request)
+                        .await
+                        .unwrap();
+                } else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            node
+        }));
+    }
+    ReplyingRPCHandle { handles, done }
+}
+
+struct ReplyingRPCHandle {
+    handles: Vec<JoinHandle<NodeSetup>>,
+    done: Arc<AtomicBool>,
+}
+
+impl ReplyingRPCHandle {
+    async fn join(mut self) -> Vec<NodeSetup> {
+        self.done.store(true, Ordering::Relaxed);
+        let mut result = Vec::new();
+        for handle in &mut self.handles {
+            result.push(handle.await.unwrap());
+        }
+        result
     }
 }
 
@@ -285,7 +416,7 @@ impl NodeSetup {
 fn new_round_on_quorum_cert() {
     let mut runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None);
     let node = &mut nodes[0];
     let genesis = node.block_store.ordered_root();
     timed_block_on(&mut runtime, async {
@@ -322,7 +453,7 @@ fn vote_on_successful_proposal() {
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // In order to observe the votes we're going to check proposal processing on the non-proposer
     // node (which will send the votes to the proposer).
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None);
     let node = &mut nodes[0];
 
     let genesis_qc = certificate_for_genesis();
@@ -359,7 +490,7 @@ fn delay_proposal_processing_in_sync_only() {
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // In order to observe the votes we're going to check proposal processing on the non-proposer
     // node (which will send the votes to the proposer).
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None);
     let node = &mut nodes[0];
 
     let genesis_qc = certificate_for_genesis();
@@ -420,7 +551,7 @@ fn no_vote_on_old_proposal() {
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // In order to observe the votes we're going to check proposal processing on the non-proposer
     // node (which will send the votes to the proposer).
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None);
     let node = &mut nodes[0];
     let genesis_qc = certificate_for_genesis();
     let new_block = Block::new_proposal(
@@ -462,7 +593,7 @@ fn no_vote_on_mismatch_round() {
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // In order to observe the votes we're going to check proposal processing on the non-proposer
     // node (which will send the votes to the proposer).
-    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1)
+    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None)
         .pop()
         .unwrap();
     let genesis_qc = certificate_for_genesis();
@@ -511,7 +642,7 @@ fn no_vote_on_mismatch_round() {
 fn sync_info_carried_on_timeout_vote() {
     let mut runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None);
     let mut node = nodes.pop().unwrap();
 
     timed_block_on(&mut runtime, async {
@@ -566,7 +697,7 @@ fn no_vote_on_invalid_proposer() {
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // In order to observe the votes we're going to check proposal processing on the non-proposer
     // node (which will send the votes to the proposer).
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 2);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 2, None);
     let incorrect_proposer = nodes.pop().unwrap();
     let mut node = nodes.pop().unwrap();
     let genesis_qc = certificate_for_genesis();
@@ -617,7 +748,7 @@ fn new_round_on_timeout_certificate() {
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // In order to observe the votes we're going to check proposal processing on the non-proposer
     // node (which will send the votes to the proposer).
-    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1)
+    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None)
         .pop()
         .unwrap();
     let genesis_qc = certificate_for_genesis();
@@ -676,7 +807,7 @@ fn reject_invalid_failed_authors() {
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // In order to observe the votes we're going to check proposal processing on the non-proposer
     // node (which will send the votes to the proposer).
-    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1)
+    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None)
         .pop()
         .unwrap();
     let genesis_qc = certificate_for_genesis();
@@ -763,7 +894,7 @@ fn reject_invalid_failed_authors() {
 fn response_on_block_retrieval() {
     let mut runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1)
+    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None)
         .pop()
         .unwrap();
 
@@ -867,7 +998,7 @@ fn response_on_block_retrieval() {
 fn recover_on_restart() {
     let mut runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1)
+    let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None)
         .pop()
         .unwrap();
     let inserter = TreeInserter::new_with_store(node.signer.clone(), node.block_store.clone());
@@ -935,7 +1066,7 @@ fn recover_on_restart() {
 fn nil_vote_on_timeout() {
     let mut runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None);
     let node = &mut nodes[0];
     let genesis = node.block_store.ordered_root();
     timed_block_on(&mut runtime, async {
@@ -969,7 +1100,7 @@ fn nil_vote_on_timeout() {
 fn vote_resent_on_timeout() {
     let mut runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None);
     let node = &mut nodes[0];
     timed_block_on(&mut runtime, async {
         let proposal_msg = node.next_proposal().await;
@@ -1000,7 +1131,7 @@ fn vote_resent_on_timeout() {
 fn sync_on_partial_newer_sync_info() {
     let mut runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None);
     let mut node = nodes.pop().unwrap();
     runtime.spawn(playground.start());
     timed_block_on(&mut runtime, async {
@@ -1052,7 +1183,7 @@ fn sync_on_partial_newer_sync_info() {
 fn safety_rules_crash() {
     let mut runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1, None);
     let mut node = nodes.pop().unwrap();
     runtime.spawn(playground.start());
 
@@ -1108,7 +1239,7 @@ fn safety_rules_crash() {
 fn echo_timeout() {
     let mut runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 4);
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 4, None);
     runtime.spawn(playground.start());
     timed_block_on(&mut runtime, async {
         // clear the message queue
@@ -1148,4 +1279,246 @@ fn echo_timeout() {
                 .unwrap();
         }
     });
+}
+
+#[test]
+fn no_next_test() {
+    let mut runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 4, None);
+    runtime.spawn(playground.start());
+
+    timed_block_on(&mut runtime, async {
+        // clear the message queue
+        for node in &mut nodes {
+            node.next_proposal().await;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        for node in nodes.iter_mut() {
+            node.no_next();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        for node in nodes.iter_mut() {
+            node.no_next();
+        }
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn block_retrieval_test() {
+    ::aptos_logger::Logger::new().level(Level::Debug).init();
+
+    let mut playground = NetworkPlayground::new(Handle::current().clone());
+    let mut nodes = NodeSetup::create_nodes(
+        &mut playground,
+        Handle::current().clone(),
+        4,
+        Some(vec![0, 1]),
+    );
+    tokio::spawn(playground.start());
+
+    for i in 0..4 {
+        process_and_vote_on_proposal(
+            &mut nodes,
+            i as usize % 2,
+            &[3],
+            true,
+            i + 1,
+            i.saturating_sub(1),
+            i.saturating_sub(1),
+        )
+        .await;
+    }
+    let mut behind_node = nodes.pop().unwrap();
+
+    // Drain the queue on other nodes
+    for node in nodes.iter_mut() {
+        let _ = node.next_proposal().await;
+    }
+
+    info!(
+        "Processing proposals for behind node {}",
+        behind_node.peer_id()
+    );
+    let handle = start_replying_to_block_retreival(nodes);
+    let proposal_msg = behind_node.next_proposal().await;
+    behind_node
+        .round_manager
+        .process_proposal_msg(proposal_msg)
+        .await
+        .unwrap();
+
+    handle.join().await;
+}
+
+async fn process_and_vote_on_proposal(
+    nodes: &mut [NodeSetup],
+    next_proposer: usize,
+    down_nodes: &[usize],
+    process_votes: bool,
+    expected_round: u64,
+    expected_qc_ordered_round: u64,
+    expected_qc_committed_round: u64,
+) {
+    info!("Called");
+    let mut num_votes = 0;
+    // let proposer_address = nodes.get(proposer).unwrap().peer_id();
+
+    for node in nodes.iter_mut() {
+        if down_nodes.contains(&node.id) {
+            // Drop the proposal on down nodes
+            node.next_proposal().await;
+        } else {
+            // Proccess proposal on other nodes
+            let proposal_msg = node.next_proposal().await;
+            // assert_eq!(proposal_msg.proposer(), proposer_address);
+
+            assert_eq!(proposal_msg.proposal().round(), expected_round);
+            assert_eq!(
+                proposal_msg.sync_info().highest_ordered_round(),
+                expected_qc_ordered_round
+            );
+            assert_eq!(
+                proposal_msg.sync_info().highest_commit_round(),
+                expected_qc_committed_round
+            );
+
+            info!("Process proposal on {}", node.peer_id());
+            node.round_manager
+                .process_proposal_msg(proposal_msg)
+                .await
+                .unwrap();
+            num_votes += 1;
+        }
+    }
+
+    info!("Voting");
+    let proposer_node = nodes.get_mut(next_proposer).unwrap();
+    let mut votes = Vec::new();
+    for _ in 0..num_votes {
+        votes.push(proposer_node.next_vote().await);
+    }
+
+    if process_votes {
+        for vote_msg in votes {
+            proposer_node
+                .round_manager
+                .process_vote_msg(vote_msg)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forking_retrieval_test() {
+    ::aptos_logger::Logger::new().level(Level::Debug).init();
+
+    let proposal_node = 0;
+    let behind_node = 6;
+    let forking_node = 5;
+
+    let mut playground = NetworkPlayground::new(Handle::current().clone());
+    let mut nodes = NodeSetup::create_nodes(
+        &mut playground,
+        Handle::current().clone(),
+        7,
+        Some(vec![
+            proposal_node,
+            proposal_node,
+            proposal_node,
+            proposal_node,
+            forking_node,
+        ]),
+    );
+    tokio::spawn(playground.start());
+
+    info!("Propose vote and commit on first block");
+    process_and_vote_on_proposal(&mut nodes, proposal_node, &[behind_node], true, 1, 0, 0).await;
+
+    info!("Propose vote and commit on second block");
+    process_and_vote_on_proposal(&mut nodes, proposal_node, &[behind_node], true, 2, 0, 0).await;
+
+    info!("Propose vote and commit on third (dangling) block");
+    process_and_vote_on_proposal(
+        &mut nodes,
+        forking_node,
+        &[behind_node, forking_node],
+        false,
+        3,
+        1,
+        1,
+    )
+    .await;
+
+    println!("Insert local timeout to all nodes on next round");
+    let mut timeout_votes = 0;
+    for node in nodes.iter_mut() {
+        if node.id != behind_node && node.id != forking_node {
+            node.round_manager
+                .process_local_timeout(3)
+                .await
+                .unwrap_err();
+            timeout_votes += 1;
+        }
+    }
+
+    println!("Process all local timeouts");
+    for node in nodes.iter_mut() {
+        for i in 0..timeout_votes {
+            let vote_msg_on_timeout = node.next_vote().await;
+            assert!(vote_msg_on_timeout.vote().is_timeout());
+            if node.id != behind_node {
+                let result = node
+                    .round_manager
+                    .process_vote_msg(vote_msg_on_timeout)
+                    .await;
+
+                if node.id == forking_node && i == 2 {
+                    result.unwrap_err();
+                } else {
+                    result.unwrap();
+                }
+
+                // result.map_err(|e| panic!("{:?} node {} {}, timeout index {}", e, node.id, node.peer_id(), i)).unwrap();
+            }
+        }
+    }
+
+    for node in nodes.iter_mut() {
+        if node.id != forking_node {
+            let vote_msg_on_timeout = node.next_vote().await;
+            assert!(vote_msg_on_timeout.vote().is_timeout());
+        }
+    }
+
+    info!("Create forked block");
+    process_and_vote_on_proposal(&mut nodes, proposal_node, &[behind_node], true, 4, 1, 1).await;
+    nodes[forking_node].next_vote().await;
+
+    // process_and_vote_on_proposal(&mut nodes, proposal_node, &[behind_node, forking_node], true, 5, 2, 2).await;
+
+    let mut behind_node = nodes.pop().unwrap();
+
+    // Drain the queue on other nodes
+    for node in nodes.iter_mut() {
+        let _ = node.next_proposal().await;
+    }
+
+    println!(
+        "Processing proposals for behind node {}",
+        behind_node.peer_id()
+    );
+    let handle = start_replying_to_block_retreival(nodes);
+    let proposal_msg = behind_node.next_proposal().await;
+    behind_node
+        .round_manager
+        .process_proposal_msg(proposal_msg)
+        .await
+        .unwrap();
+
+    handle.join().await;
 }
